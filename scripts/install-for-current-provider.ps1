@@ -3,7 +3,8 @@ param(
   [string]$StateRoot = "$HOME\.codex-retry-gateway",
   [string]$ListenHost = "127.0.0.1",
   [int]$ListenPort = 4610,
-  [switch]$InternalFromLaunchUi
+  [switch]$InternalFromLaunchUi,
+  [switch]$ConfigureCodex
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +18,8 @@ if (-not $InternalFromLaunchUi) {
     -StateRoot $StateRoot `
     -ListenHost $ListenHost `
     -ListenPort $ListenPort `
-    -NoOpen
+    -NoOpen `
+    -ConfigureCodex
   $resultPaths = Get-GatewayStatePaths -StateRoot $StateRoot
   $resultState = Read-JsonFile -Path $resultPaths.StatePath
   $resultGatewayConfig = Read-JsonFile -Path $resultPaths.ConfigPath
@@ -79,7 +81,7 @@ $backupPath = if (
 } else {
   ""
 }
-if ([string]::IsNullOrWhiteSpace($backupPath) -and $providerContext.CurrentBaseUrl -ne $localGatewayBaseUrl) {
+if ($ConfigureCodex -and [string]::IsNullOrWhiteSpace($backupPath) -and $providerContext.CurrentBaseUrl -ne $localGatewayBaseUrl) {
   $backupTimestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
   $backupSuffix = 0
   do {
@@ -138,14 +140,16 @@ if ($gatewayConfig.request_body_limit_bytes -le 0 -or $gatewayConfig.request_bod
   $gatewayConfig.request_body_limit_bytes = 104857600
 }
 
-$previousConfigContent = Get-Content -LiteralPath $CodexConfigPath -Raw
+$previousConfigContent = if ($ConfigureCodex) { Get-Content -LiteralPath $CodexConfigPath -Raw } else { $null }
 
 try {
   Write-JsonFile -Path $paths.ConfigPath -Value $gatewayConfig
-  Set-CodexProviderBaseUrl `
-    -CodexConfigPath $CodexConfigPath `
-    -ProviderName $providerContext.ProviderName `
-    -NewBaseUrl $localGatewayBaseUrl
+  if ($ConfigureCodex) {
+    Set-CodexProviderBaseUrl `
+      -CodexConfigPath $CodexConfigPath `
+      -ProviderName $providerContext.ProviderName `
+      -NewBaseUrl $localGatewayBaseUrl
+  }
 
   & (Join-Path $PSScriptRoot "start-gateway.ps1") `
     -StateRoot $StateRoot `
@@ -176,7 +180,9 @@ try {
   Write-Output "config=$($paths.ConfigPath)"
   Write-Output "backup=$backupPath"
 } catch {
-  Write-Utf8NoBomFile -Path $CodexConfigPath -Content $previousConfigContent
-  & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
+  if ($ConfigureCodex) {
+    Write-Utf8NoBomFile -Path $CodexConfigPath -Content $previousConfigContent
+  }
+  & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet -SkipRestore
   throw
 }

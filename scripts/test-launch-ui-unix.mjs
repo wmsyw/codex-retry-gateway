@@ -293,6 +293,8 @@ async function run() {
     ].join("\n"),
     "utf8",
   );
+  const originalCodexConfigRaw = await readFile(codexConfigPath, "utf8");
+  const originalCodexConfigMtime = await mtimeNs(codexConfigPath);
 
   const upstream = await startFakeUpstream(upstreamPort);
 
@@ -307,10 +309,72 @@ async function run() {
       "--no-open",
     ]);
 
+    const launchedConfig = await readFile(codexConfigPath, "utf8");
+    assert(launchedConfig === originalCodexConfigRaw, "Unix launch modified Codex config bytes");
+    assert(
+      (await mtimeNs(codexConfigPath)) === originalCodexConfigMtime,
+      "Unix launch touched Codex config mtime",
+    );
+    assert(
+      (await readdir(path.join(stateRoot, "backups"))).length === 0,
+      "Unix launch created a Codex config backup",
+    );
+    const backuplessGatewayPidPath = path.join(stateRoot, "gateway.pid");
+    const backuplessGatewayPid = Number.parseInt(
+      (await readFile(backuplessGatewayPidPath, "utf8")).trim(),
+      10,
+    );
+    const backuplessShutdownResponse = await fetch(
+      `${gatewayBaseUrl}/__codex_retry_gateway/api/restore`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+    );
+    const backuplessShutdownPayload = await backuplessShutdownResponse.json();
+    assert(
+      backuplessShutdownResponse.status === 202 && backuplessShutdownPayload.restored === false,
+      `Unix backupless shutdown failed: ${backuplessShutdownResponse.status} ${JSON.stringify(backuplessShutdownPayload)}`,
+    );
+    const backuplessShutdownDeadline = Date.now() + 5000;
+    while (Date.now() < backuplessShutdownDeadline && isProcessAlive(backuplessGatewayPid)) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert(!isProcessAlive(backuplessGatewayPid), "Unix backupless UI shutdown left the gateway running");
+    assert(
+      (await readFile(codexConfigPath, "utf8")) === originalCodexConfigRaw,
+      "Unix backupless UI shutdown modified Codex config",
+    );
+    assert(
+      await pathExists(path.join(stateRoot, "state.json")),
+      "Unix backupless UI shutdown removed reusable gateway state",
+    );
+    assert(!(await pathExists(backuplessGatewayPidPath)), "Unix backupless UI shutdown retained the PID file");
+
+    const relaunchAfterBackuplessShutdown = await runBashScript(launchScript, [
+      "--codex-config-path",
+      toUnixPathForBash(codexConfigPath),
+      "--state-root",
+      toUnixPathForBash(stateRoot),
+      "--listen-port",
+      String(gatewayPort),
+      "--no-open",
+    ]);
+    assert(
+      relaunchAfterBackuplessShutdown.stdout.includes("mode=reuse"),
+      "Unix launch did not reuse state after backupless UI shutdown",
+    );
+
+
+    await runBashScript(installScript, [
+      "--codex-config-path",
+      toUnixPathForBash(codexConfigPath),
+      "--state-root",
+      toUnixPathForBash(stateRoot),
+      "--listen-port",
+      String(gatewayPort),
+    ]);
     const installedConfig = await readFile(codexConfigPath, "utf8");
     assert(
       installedConfig.includes(`base_url = "${gatewayBaseUrl}"`),
-      "Unix launch did not redirect the current provider to the local gateway",
+      "Unix explicit install did not redirect the current provider to the local gateway",
     );
     const gatewayConfig = JSON.parse(
       await readFile(path.join(stateRoot, "config", "config.json"), "utf8"),
@@ -595,7 +659,7 @@ async function run() {
     );
     await writeFile(gatewayConfigPath, firstGatewayConfigRaw, "utf8");
 
-    await runBashScript(stopScript, ["--state-root", toUnixPathForBash(stateRoot), "--quiet"]);
+    await runBashScript(stopScript, ["--state-root", toUnixPathForBash(stateRoot), "--quiet", "--skip-restore"]);
     stalePidProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
       stdio: "ignore",
       windowsHide: true,
@@ -613,7 +677,7 @@ async function run() {
       (await fetch(`${gatewayBaseUrl}/__codex_retry_gateway/health`)).status === 200,
       "Unix direct start did not launch a healthy gateway after discarding stale PID identity",
     );
-    await runBashScript(stopScript, ["--state-root", toUnixPathForBash(stateRoot), "--quiet"]);
+    await runBashScript(stopScript, ["--state-root", toUnixPathForBash(stateRoot), "--quiet", "--skip-restore"]);
     await writeFile(gatewayPidPath, `${stalePidProcess.pid}`, "utf8");
     const recoveredLaunch = await runBashScript(launchScript, [
       "--codex-config-path",
@@ -647,14 +711,11 @@ async function run() {
     const recoveredStateRaw = await readFile(statePath, "utf8");
 
     const driftedUpstreamBaseUrl = `${upstreamBaseUrl}/v1`;
-    await writeFile(
-      codexConfigPath,
-      firstCodexConfigRaw.replace(
-        `base_url = "${gatewayBaseUrl}"`,
-        `base_url = "${driftedUpstreamBaseUrl}"`,
-      ),
-      "utf8",
+    const driftedCodexConfigRaw = firstCodexConfigRaw.replace(
+      `base_url = "${gatewayBaseUrl}"`,
+      `base_url = "${driftedUpstreamBaseUrl}"`,
     );
+    await writeFile(codexConfigPath, driftedCodexConfigRaw, "utf8");
     const driftRepair = await runBashScript(launchScript, [
       "--codex-config-path",
       toUnixPathForBash(codexConfigPath),
@@ -666,8 +727,8 @@ async function run() {
     ]);
     assert(driftRepair.stdout.includes("mode=reuse"), "Unix provider drift did not reuse install identity");
     assert(
-      (await readFile(codexConfigPath, "utf8")).includes(`base_url = "${gatewayBaseUrl}"`),
-      "Unix provider drift repair did not restore gateway takeover",
+      (await readFile(codexConfigPath, "utf8")) === driftedCodexConfigRaw,
+      "Unix launch rewrote a manually adjusted Codex provider",
     );
     assert(
       (await readFile(gatewayConfigPath, "utf8")) === firstGatewayConfigRaw,
@@ -728,7 +789,7 @@ async function run() {
     );
 
     const realProviderConfigRaw = (await readFile(codexConfigPath, "utf8")).replace(
-      `base_url = "${gatewayBaseUrl}"`,
+      `base_url = "${driftedUpstreamBaseUrl}"`,
       `base_url = "${upstreamBaseUrl}"`,
     );
     await writeFile(codexConfigPath, realProviderConfigRaw, "utf8");
@@ -741,25 +802,27 @@ async function run() {
       String(gatewayPort),
       "--no-open",
     ]);
-    const repairedBackupState = JSON.parse(await readFile(statePath, "utf8"));
-    const backupsAfterRecoveryPoint = (await readdir(backupDir)).sort();
-    assert(repairedBackupState.latest_backup_path, "Unix real provider drift did not repair the missing recovery backup");
     assert(
-      backupsAfterRecoveryPoint.length === backupsBeforeRecoveryPoint.length + 1,
-      "Unix real provider drift did not create exactly one recovery backup",
+      (await readFile(statePath, "utf8")) === stateWithoutBackupRaw,
+      "Unix launch repaired missing backup state without an explicit install",
     );
     assert(
-      backupsAfterRecoveryPoint.includes(path.basename(repairedBackupState.latest_backup_path)),
-      "Unix repaired state does not reference the new recovery backup",
+      JSON.stringify((await readdir(backupDir)).sort()) === JSON.stringify(backupsBeforeRecoveryPoint),
+      "Unix launch created a recovery backup for a manually adjusted provider",
     );
     assert(
-      (await readFile(repairedBackupState.latest_backup_path, "utf8")) === realProviderConfigRaw,
-      "Unix recovery backup did not preserve the real provider config bytes",
+      (await readFile(codexConfigPath, "utf8")) === realProviderConfigRaw,
+      "Unix launch rewrote the manually adjusted provider while checking recovery state",
     );
-    assert((await readFile(gatewayConfigPath, "utf8")) === firstGatewayConfigRaw, "Unix backup repair changed gateway settings");
     assert(
       (await readFile(gatewayPidPath, "utf8")).trim() === recoveredGatewayPid,
-      "Unix backup repair restarted the healthy gateway",
+      "Unix provider-only adjustment restarted the healthy gateway",
+    );
+    const initialBackupPath = JSON.parse(firstStateRaw).latest_backup_path;
+    await writeFile(
+      statePath,
+      `${JSON.stringify({ ...JSON.parse(stateWithoutBackupRaw), latest_backup_path: initialBackupPath }, null, 2)}\n`,
+      "utf8",
     );
 
     await writeFile(
@@ -870,9 +933,7 @@ async function run() {
     );
     await writeFile(statePath, stateBeforeDirectoryRestore, "utf8");
 
-    await runBashScript(restoreScript, [
-      "--codex-config-path",
-      toUnixPathForBash(codexConfigPath),
+    await runBashScript(stopScript, [
       "--state-root",
       toUnixPathForBash(stateRoot),
     ]);
@@ -882,6 +943,7 @@ async function run() {
       restoredConfig.includes(`base_url = "${upstreamBaseUrl}"`),
       "Unix restore did not preserve the immutable first-install recovery point",
     );
+    assert(!(await pathExists(statePath)), "Unix stop did not clear restored install state");
 
     const backupsBeforeMissingConfigRecovery = (await readdir(backupDir)).sort();
     await writeFile(codexConfigPath, firstCodexConfigRaw, "utf8");
@@ -949,17 +1011,34 @@ async function run() {
     const providerBState = JSON.parse(await readFile(statePath, "utf8"));
     const backupsAfterProviderSwitch = (await readdir(backupDir)).sort();
     assert(providerBState.provider_name === "provider-b", "Unix Provider B launch did not replace provider identity");
+    assert(providerBState.latest_backup_path === "", "Unix Provider B launch reused Provider A's recovery backup");
     assert(
-      providerBState.latest_backup_path !== providerABackupPath,
-      "Unix Provider B reused Provider A's recovery backup",
+      JSON.stringify(backupsAfterProviderSwitch) === JSON.stringify(backupsBeforeProviderSwitch),
+      "Unix Provider B launch created a provider-specific backup",
     );
     assert(
-      backupsAfterProviderSwitch.length === backupsBeforeProviderSwitch.length + 1,
-      "Unix Provider B launch did not create exactly one provider-specific backup",
+      (await readFile(codexConfigPath, "utf8")) === providerBConfigRaw,
+      "Unix Provider B launch rewrote Codex config",
+    );
+
+    await runBashScript(installScript, [
+      "--codex-config-path",
+      toUnixPathForBash(codexConfigPath),
+      "--state-root",
+      toUnixPathForBash(stateRoot),
+      "--listen-port",
+      String(gatewayPort),
+    ]);
+    const installedProviderBState = JSON.parse(await readFile(statePath, "utf8"));
+    const backupsAfterProviderBInstall = (await readdir(backupDir)).sort();
+    assert(installedProviderBState.latest_backup_path, "Unix Provider B install did not create a recovery backup");
+    assert(
+      backupsAfterProviderBInstall.length === backupsBeforeProviderSwitch.length + 1,
+      "Unix Provider B install did not create exactly one provider-specific backup",
     );
     assert(
-      (await readFile(providerBState.latest_backup_path, "utf8")) === providerBConfigRaw,
-      "Unix Provider B recovery backup did not preserve Provider B config bytes",
+      (await readFile(installedProviderBState.latest_backup_path, "utf8")) === providerBConfigRaw,
+      "Unix Provider B install backup did not preserve Provider B config bytes",
     );
 
     const mismatchedProviderConfigRaw = [
@@ -1017,7 +1096,7 @@ async function run() {
   } finally {
     await stopChildProcess(stalePidProcess);
     try {
-      await runBashScript(stopScript, ["--state-root", toUnixPathForBash(stateRoot), "--quiet"]);
+      await runBashScript(stopScript, ["--state-root", toUnixPathForBash(stateRoot), "--quiet", "--skip-restore"]);
     } catch {
       // 测试清理阶段允许忽略停止失败，避免覆盖主失败原因。
     }

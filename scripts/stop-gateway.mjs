@@ -7,10 +7,11 @@ import {
 } from "./admin-lib.mjs";
 
 async function main() {
-  const options = parseOptions(process.argv, { booleanFlags: ["quiet"] });
+  const options = parseOptions(process.argv, { booleanFlags: ["quiet", "skip-restore"] });
   const message = await stopGateway({
     stateRoot: options.stateRoot || DEFAULT_STATE_ROOT,
     quiet: Boolean(options.quiet),
+    restoreBackup: !options.skipRestore,
   });
 
   if (message) {

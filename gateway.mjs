@@ -6299,19 +6299,26 @@ async function readRuntimeState(runtime) {
 async function restoreRuntimeState(runtime, state) {
   const backupPath = state?.latest_backup_path;
   const codexConfigPath = state?.codex_config_path;
+  let restored = false;
 
-  if (!backupPath || !fs.existsSync(backupPath) || !fs.statSync(backupPath).isFile()) {
-    throw new Error(`未找到可恢复备份: ${backupPath || "unknown"}`);
-  }
-  if (!codexConfigPath) {
-    throw new Error("安装状态里缺少 codex_config_path");
+  if (backupPath) {
+    if (!fs.existsSync(backupPath) || !fs.statSync(backupPath).isFile()) {
+      throw new Error(`未找到可恢复备份: ${backupPath}`);
+    }
+    if (!codexConfigPath) {
+      throw new Error("安装状态里缺少 codex_config_path");
+    }
+
+    await copyFile(backupPath, codexConfigPath);
+    await rm(runtime.paths.statePath, { force: true });
+    restored = true;
   }
 
-  await copyFile(backupPath, codexConfigPath);
-  await Promise.all([
-    rm(runtime.paths.statePath, { force: true }),
-    rm(runtime.paths.pidPath, { force: true }),
-  ]);
+  await rm(runtime.paths.pidPath, { force: true });
+  return {
+    restored,
+    backup_path: restored ? backupPath : null,
+  };
 }
 
 function jsonResponse(res, statusCode, payload, headers = {}) {
@@ -10615,21 +10622,19 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {
 
   if (pathname === RESTORE_API_PATH && req.method === "POST") {
     const state = await readRuntimeState(runtime);
-    if (!state) {
-      jsonResponse(res, 409, {
-        error: {
-          message: "当前未检测到安装状态，无法恢复 Codex 原设置",
-          code: "state_not_found",
-        },
-      });
-      return true;
-    }
-
-    await restoreRuntimeState(runtime, state);
-    runtime.logger(`[restore] restored via UI state_root=${runtime.paths.stateRoot}`);
+    const restoreResult = await restoreRuntimeState(runtime, state);
+    runtime.logger(
+      restoreResult.restored
+        ? `[restore] restored via UI state_root=${runtime.paths.stateRoot}`
+        : `[shutdown] no Codex backup required state_root=${runtime.paths.stateRoot}`,
+    );
     jsonResponse(res, 202, {
       ok: true,
-      message: "原设置已恢复，gateway 即将关闭",
+      restored: restoreResult.restored,
+      message: restoreResult.restored
+        ? "原设置已恢复，gateway 即将关闭"
+        : "Codex 配置未被 gateway 修改，无需恢复；gateway 即将关闭",
+
     });
     res.on("finish", () => {
       const exitTimer = setTimeout(() => {

@@ -1297,7 +1297,7 @@ async function run() {
     process.stdout.write("PASS install-restore flow\n");
   } finally {
     try {
-      await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet"]);
+      await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet", "-SkipRestore"]);
     } catch {
       // 测试清理阶段允许忽略停止失败，避免覆盖主失败原因。
     }

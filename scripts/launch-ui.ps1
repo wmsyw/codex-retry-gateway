@@ -3,7 +3,8 @@ param(
   [string]$StateRoot = "$HOME\.codex-retry-gateway",
   [string]$ListenHost = "127.0.0.1",
   [int]$ListenPort = 4610,
-  [switch]$NoOpen
+  [switch]$NoOpen,
+  [switch]$ConfigureCodex
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +82,7 @@ if (-not $canReuseExistingInstall) {
     -StateRoot $StateRoot `
     -ListenHost $ListenHost `
     -ListenPort $ListenPort `
+    -ConfigureCodex:$ConfigureCodex `
     -InternalFromLaunchUi
 } else {
   $mode = "reuse"
@@ -243,7 +245,7 @@ if (-not $canReuseExistingInstall) {
     $recoveryBackupUsable =
       (-not [string]::IsNullOrWhiteSpace($recoveryBackupPath)) -and
       (Test-Path -LiteralPath $recoveryBackupPath -PathType Leaf)
-    if ((-not $recoveryBackupUsable) -and ($managedGatewayBaseUrls -notcontains $currentBaseUrl)) {
+    if ($ConfigureCodex -and (-not $recoveryBackupUsable) -and ($managedGatewayBaseUrls -notcontains $currentBaseUrl)) {
       $backupTimestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
       $backupSuffix = 0
       do {
@@ -263,7 +265,7 @@ if (-not $canReuseExistingInstall) {
           Write-Utf8NoBomFile -Path $paths.ConfigPath -Content $previousGatewayRuntimeConfigContent
           $temporaryIdentityConfigWritten = $true
         }
-        & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
+        & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet -SkipRestore
       } finally {
         if ($temporaryIdentityConfigWritten) {
           Remove-Item -LiteralPath $paths.ConfigPath -Force -ErrorAction SilentlyContinue
@@ -276,7 +278,7 @@ if (-not $canReuseExistingInstall) {
       $gatewayConfigWritten = $true
     }
 
-    if ($currentBaseUrl -ne $requestedGatewayBaseUrl) {
+    if ($ConfigureCodex -and $currentBaseUrl -ne $requestedGatewayBaseUrl) {
       Set-CodexProviderBaseUrl `
         -CodexConfigPath $CodexConfigPath `
         -ProviderName $providerContext.ProviderName `
@@ -318,7 +320,7 @@ if (-not $canReuseExistingInstall) {
 
     if ($gatewayLifecycleAttempted) {
       try {
-        & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
+        & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet -SkipRestore
       } catch {
         $rollbackErrors.Add($_.Exception.Message)
       }

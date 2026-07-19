@@ -36,7 +36,7 @@ if (Test-Path -LiteralPath $paths.PidPath) {
     if (Test-ProcessAlive -ProcessId $existingPid) {
       if (Test-GatewayProcessIdentity -ProcessId $existingPid -GatewayConfig $gatewayConfig) {
         if ($RestartIfRunning) {
-          & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
+          & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet -SkipRestore
         } else {
           Write-Output "Gateway is already running. PID=$existingPid"
           exit 0

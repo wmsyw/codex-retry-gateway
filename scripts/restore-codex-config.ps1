@@ -19,7 +19,7 @@ if ([string]::IsNullOrWhiteSpace($backupPath) -or -not (Test-Path -LiteralPath $
   throw "A restorable backup file was not found: $backupPath"
 }
 
-& (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
+& (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet -SkipRestore
 Copy-Item -LiteralPath $backupPath -Destination $CodexConfigPath -Force
 Remove-Item -LiteralPath $paths.StatePath -Force -ErrorAction SilentlyContinue
 

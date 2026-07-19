@@ -502,52 +502,77 @@ export async function stopGateway({
   stateRoot = DEFAULT_STATE_ROOT,
   quiet = false,
   gatewayConfig: expectedGatewayConfig = null,
+  restoreBackup = true,
 }) {
   const paths = getGatewayStatePaths(stateRoot);
+  const state = restoreBackup ? await readJsonFile(paths.statePath) : null;
+  const backupPath = state?.latest_backup_path ? `${state.latest_backup_path}` : "";
+  let restorePlan = null;
+  if (backupPath) {
+    if (!isFilePath(backupPath)) {
+      throw new Error(`A restorable backup file was not found: ${backupPath}`);
+    }
+    restorePlan = {
+      backupPath,
+      codexConfigPath: state?.codex_config_path
+        ? `${state.codex_config_path}`
+        : DEFAULT_CODEX_CONFIG_PATH,
+    };
+  }
+
+  let message;
   if (!fs.existsSync(paths.pidPath)) {
-    return quiet ? null : "No running gateway PID file was found.";
-  }
+    message = "No running gateway PID file was found.";
+  } else {
+    const pidRaw = (await readFile(paths.pidPath, "utf8")).trim();
+    if (!pidRaw) {
+      await rm(paths.pidPath, { force: true });
+      message = "Gateway PID file was empty and has been removed.";
+    } else {
+      const gatewayPid = Number.parseInt(pidRaw, 10);
+      if (Number.isInteger(gatewayPid) && isProcessAlive(gatewayPid)) {
+        let gatewayConfig = expectedGatewayConfig || await readJsonFile(paths.configPath);
+        if (!gatewayConfig) {
+          const runtimeState = state || await readJsonFile(paths.statePath);
+          gatewayConfig = await readGatewayRuntimeConfig(runtimeState?.gateway_base_url, gatewayPid);
+        }
+        const verifiedGatewayProcess =
+          gatewayConfig && await isGatewayHealthy(gatewayConfig, gatewayPid);
+        if (!verifiedGatewayProcess) {
+          throw new Error(`Gateway PID could not be verified and was not stopped: ${gatewayPid}`);
+        }
+        try {
+          process.kill(gatewayPid);
+        } catch {
+          // ignore first failure
+        }
 
-  const pidRaw = (await readFile(paths.pidPath, "utf8")).trim();
-  if (!pidRaw) {
-    await rm(paths.pidPath, { force: true });
-    return quiet ? null : "Gateway PID file was empty and has been removed.";
-  }
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline && isProcessAlive(gatewayPid)) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
 
-  const gatewayPid = Number.parseInt(pidRaw, 10);
-  if (Number.isInteger(gatewayPid) && isProcessAlive(gatewayPid)) {
-    let gatewayConfig = expectedGatewayConfig || await readJsonFile(paths.configPath);
-    if (!gatewayConfig) {
-      const state = await readJsonFile(paths.statePath);
-      gatewayConfig = await readGatewayRuntimeConfig(state?.gateway_base_url, gatewayPid);
-    }
-    const verifiedGatewayProcess =
-      gatewayConfig && await isGatewayHealthy(gatewayConfig, gatewayPid);
-    if (!verifiedGatewayProcess) {
-      throw new Error(`Gateway PID could not be verified and was not stopped: ${gatewayPid}`);
-    }
-    try {
-      process.kill(gatewayPid);
-    } catch {
-      // ignore first failure
-    }
-
-    const deadline = Date.now() + 3000;
-    while (Date.now() < deadline && isProcessAlive(gatewayPid)) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    if (isProcessAlive(gatewayPid)) {
-      try {
-        process.kill(gatewayPid, "SIGKILL");
-      } catch {
-        // ignore hard kill failure
+        if (isProcessAlive(gatewayPid)) {
+          try {
+            process.kill(gatewayPid, "SIGKILL");
+          } catch {
+            // ignore hard kill failure
+          }
+        }
       }
+
+      await rm(paths.pidPath, { force: true });
+      message = `Gateway stopped. PID=${gatewayPid}`;
     }
   }
 
-  await rm(paths.pidPath, { force: true });
-  return quiet ? null : `Gateway stopped. PID=${gatewayPid}`;
+  if (restorePlan) {
+    await copyFile(restorePlan.backupPath, restorePlan.codexConfigPath);
+    await rm(paths.statePath, { force: true });
+    message = `${message} Codex config restored from ${restorePlan.backupPath}.`;
+  }
+
+  return quiet ? null : message;
 }
 
 export async function cleanupFailedGatewayStart({ processId, pidPath }) {
@@ -615,7 +640,7 @@ export async function startGateway({
       if (Number.isInteger(existingPid) && isProcessAlive(existingPid)) {
         if (await isGatewayHealthy(gatewayConfig, existingPid)) {
           if (restartIfRunning) {
-            await stopGateway({ stateRoot, quiet: true });
+            await stopGateway({ stateRoot, quiet: true, restoreBackup: false });
           } else {
             return `Gateway is already running. PID=${existingPid}`;
           }
@@ -673,6 +698,7 @@ async function applyInstallForCurrentProvider({
   stateRoot = DEFAULT_STATE_ROOT,
   listenHost = DEFAULT_LISTEN_HOST,
   listenPort = DEFAULT_LISTEN_PORT,
+  configureCodex = false,
 }) {
   const paths = getGatewayStatePaths(stateRoot);
   await ensureDirectory(paths.stateRoot);
@@ -716,7 +742,7 @@ async function applyInstallForCurrentProvider({
       ? `${existingState.latest_backup_path}`
       : "";
   let backupPath = isFilePath(existingBackupPath) ? existingBackupPath : "";
-  if (!backupPath && providerContext.currentBaseUrl !== localGatewayBaseUrl) {
+  if (configureCodex && !backupPath && providerContext.currentBaseUrl !== localGatewayBaseUrl) {
     backupPath = createUniqueBackupPath(paths.backupDir);
     await copyFile(codexConfigPath, backupPath);
   }
@@ -781,15 +807,19 @@ async function applyInstallForCurrentProvider({
     health_path: existingGatewayConfig?.health_path || DEFAULT_HEALTH_PATH,
   };
 
-  const previousConfigContent = await readFile(codexConfigPath, "utf8");
+  const previousConfigContent = configureCodex
+    ? await readFile(codexConfigPath, "utf8")
+    : null;
 
   try {
     await writeJsonFile(paths.configPath, gatewayConfig);
-    await setCodexProviderBaseUrl({
-      codexConfigPath,
-      providerName: providerContext.providerName,
-      newBaseUrl: localGatewayBaseUrl,
-    });
+    if (configureCodex) {
+      await setCodexProviderBaseUrl({
+        codexConfigPath,
+        providerName: providerContext.providerName,
+        newBaseUrl: localGatewayBaseUrl,
+      });
+    }
 
     await startGateway({
       stateRoot,
@@ -822,8 +852,10 @@ async function applyInstallForCurrentProvider({
       backupPath,
     };
   } catch (error) {
-    await writeUtf8File(codexConfigPath, previousConfigContent);
-    await stopGateway({ stateRoot, quiet: true });
+    if (configureCodex) {
+      await writeUtf8File(codexConfigPath, previousConfigContent);
+    }
+    await stopGateway({ stateRoot, quiet: true, restoreBackup: false });
     throw error;
   }
 }
@@ -840,6 +872,7 @@ export async function installForCurrentProvider({
     listenHost,
     listenPort,
     noOpen: true,
+    configureCodex: true,
   });
   const paths = getGatewayStatePaths(stateRoot);
   const state = await readJsonFile(paths.statePath);
@@ -870,7 +903,7 @@ export async function restoreCodexConfig({
     throw new Error(`A restorable backup file was not found: ${backupPath}`);
   }
 
-  await stopGateway({ stateRoot, quiet: true });
+  await stopGateway({ stateRoot, quiet: true, restoreBackup: false });
   await copyFile(backupPath, codexConfigPath);
   await rm(paths.statePath, { force: true });
 
@@ -886,6 +919,7 @@ export async function launchUi({
   listenHost = DEFAULT_LISTEN_HOST,
   listenPort = DEFAULT_LISTEN_PORT,
   noOpen = false,
+  configureCodex = false,
 }) {
   const paths = getGatewayStatePaths(stateRoot);
   await ensureDirectory(paths.stateRoot);
@@ -931,6 +965,7 @@ export async function launchUi({
       stateRoot,
       listenHost,
       listenPort,
+      configureCodex,
     });
   } else {
     mode = "reuse";
@@ -1037,7 +1072,7 @@ export async function launchUi({
         ].filter(Boolean),
       );
       const recoveryBackupUsable = isFilePath(recoveryBackupPath);
-      if (!recoveryBackupUsable && !managedGatewayBaseUrls.has(currentBaseUrl)) {
+      if (configureCodex && !recoveryBackupUsable && !managedGatewayBaseUrls.has(currentBaseUrl)) {
         recoveryBackupPath = createUniqueBackupPath(paths.backupDir);
         await copyFile(codexConfigPath, recoveryBackupPath);
         recoveryBackupCreated = true;
@@ -1049,6 +1084,7 @@ export async function launchUi({
           stateRoot,
           quiet: true,
           gatewayConfig: existingGatewayConfig,
+          restoreBackup: false,
         });
       }
 
@@ -1057,7 +1093,7 @@ export async function launchUi({
         gatewayConfigWritten = true;
       }
 
-      if (currentBaseUrl !== requestedGatewayBaseUrl) {
+      if (configureCodex && currentBaseUrl !== requestedGatewayBaseUrl) {
         await setCodexProviderBaseUrl({
           codexConfigPath,
           providerName: providerContext.providerName,
@@ -1101,7 +1137,7 @@ export async function launchUi({
 
       if (gatewayLifecycleAttempted) {
         try {
-          await stopGateway({ stateRoot, quiet: true });
+          await stopGateway({ stateRoot, quiet: true, restoreBackup: false });
         } catch (rollbackError) {
           rollbackErrors.push(rollbackError);
         }

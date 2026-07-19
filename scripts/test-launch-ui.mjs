@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 
 const scriptsRoot = import.meta.dirname;
 const launchScript = path.join(scriptsRoot, "launch-ui.ps1");
+const installScript = path.join(scriptsRoot, "install-for-current-provider.ps1");
 const startScript = path.join(scriptsRoot, "start-gateway.ps1");
 const stopScript = path.join(scriptsRoot, "stop-gateway.ps1");
 const restoreScript = path.join(scriptsRoot, "restore-codex-config.ps1");
@@ -320,6 +321,8 @@ async function run() {
     ].join("\n"),
     "utf8",
   );
+  const originalCodexConfigRaw = await readFile(codexConfigPath, "utf8");
+  const originalCodexConfigMtime = await mtimeNs(codexConfigPath);
 
   const upstream = await startFakeUpstream(upstreamPort);
 
@@ -334,10 +337,29 @@ async function run() {
       "-NoOpen",
     ]);
 
+    const launchedConfig = await readFile(codexConfigPath, "utf8");
+    assert(launchedConfig === originalCodexConfigRaw, "First launch modified Codex config bytes");
+    assert(
+      (await mtimeNs(codexConfigPath)) === originalCodexConfigMtime,
+      "First launch touched Codex config mtime",
+    );
+    assert(
+      (await readdir(path.join(stateRoot, "backups"))).length === 0,
+      "First launch created a Codex config backup",
+    );
+
+    await runPowerShellScript(installScript, [
+      "-CodexConfigPath",
+      codexConfigPath,
+      "-StateRoot",
+      stateRoot,
+      "-ListenPort",
+      String(gatewayPort),
+    ]);
     const installedConfig = await readFile(codexConfigPath, "utf8");
     assert(
       installedConfig.includes(`base_url = "${gatewayBaseUrl}"`),
-      "First launch did not redirect the current provider to the local gateway",
+      "Explicit install did not redirect the current provider to the local gateway",
     );
 
     const uiResponse = await fetch(`${gatewayBaseUrl}/__codex_retry_gateway/ui`);
@@ -573,7 +595,7 @@ async function run() {
     );
     await writeFile(gatewayConfigPath, firstGatewayConfigRaw, "utf8");
 
-    await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet"]);
+    await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet", "-SkipRestore"]);
     stalePidProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
       stdio: "ignore",
       windowsHide: true,
@@ -591,7 +613,7 @@ async function run() {
       (await fetch(`${gatewayBaseUrl}/__codex_retry_gateway/health`)).status === 200,
       "Direct start did not launch a healthy gateway after discarding stale PID identity",
     );
-    await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet"]);
+    await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet", "-SkipRestore"]);
     await writeFile(gatewayPidPath, `${stalePidProcess.pid}`, "utf8");
     const recoveredLaunch = await runPowerShellScript(launchScript, [
       "-CodexConfigPath",
@@ -628,14 +650,11 @@ async function run() {
     const recoveredStateRaw = await readFile(statePath, "utf8");
 
     const driftedUpstreamBaseUrl = `${upstreamBaseUrl}/v1`;
-    await writeFile(
-      codexConfigPath,
-      secondCodexConfigRaw.replace(
-        `base_url = "${gatewayBaseUrl}"`,
-        `base_url = "${driftedUpstreamBaseUrl}"`,
-      ),
-      "utf8",
+    const driftedCodexConfigRaw = secondCodexConfigRaw.replace(
+      `base_url = "${gatewayBaseUrl}"`,
+      `base_url = "${driftedUpstreamBaseUrl}"`,
     );
+    await writeFile(codexConfigPath, driftedCodexConfigRaw, "utf8");
     const driftRepair = await runPowerShellScript(launchScript, [
       "-CodexConfigPath",
       codexConfigPath,
@@ -647,8 +666,8 @@ async function run() {
     ]);
     assert(driftRepair.stdout.includes("mode=reuse"), "Provider drift did not reuse the existing install identity");
     assert(
-      (await readFile(codexConfigPath, "utf8")).includes(`base_url = "${gatewayBaseUrl}"`),
-      "Provider drift repair did not restore gateway takeover",
+      (await readFile(codexConfigPath, "utf8")) === driftedCodexConfigRaw,
+      "Launch rewrote a manually adjusted Codex provider",
     );
     assert(
       (await readFile(gatewayConfigPath, "utf8")) === secondGatewayConfigRaw,
@@ -709,7 +728,7 @@ async function run() {
     );
 
     const realProviderConfigRaw = (await readFile(codexConfigPath, "utf8")).replace(
-      `base_url = "${gatewayBaseUrl}"`,
+      `base_url = "${driftedUpstreamBaseUrl}"`,
       `base_url = "${upstreamBaseUrl}"`,
     );
     await writeFile(codexConfigPath, realProviderConfigRaw, "utf8");
@@ -722,25 +741,27 @@ async function run() {
       String(gatewayPort),
       "-NoOpen",
     ]);
-    const repairedBackupState = JSON.parse(await readFile(statePath, "utf8"));
-    const backupsAfterRecoveryPoint = (await readdir(backupDir)).sort();
-    assert(repairedBackupState.latest_backup_path, "Real provider drift did not repair the missing recovery backup");
     assert(
-      backupsAfterRecoveryPoint.length === backupsBeforeRecoveryPoint.length + 1,
-      "Real provider drift did not create exactly one recovery backup",
+      (await readFile(statePath, "utf8")) === stateWithoutBackupRaw,
+      "Launch repaired missing backup state without an explicit install",
     );
     assert(
-      backupsAfterRecoveryPoint.includes(path.basename(repairedBackupState.latest_backup_path)),
-      "Repaired state does not reference the new recovery backup",
+      JSON.stringify((await readdir(backupDir)).sort()) === JSON.stringify(backupsBeforeRecoveryPoint),
+      "Launch created a recovery backup for a manually adjusted provider",
     );
     assert(
-      (await readFile(repairedBackupState.latest_backup_path, "utf8")) === realProviderConfigRaw,
-      "Recovery backup did not preserve the real provider config bytes",
+      (await readFile(codexConfigPath, "utf8")) === realProviderConfigRaw,
+      "Launch rewrote the manually adjusted provider while checking recovery state",
     );
-    assert((await readFile(gatewayConfigPath, "utf8")) === secondGatewayConfigRaw, "Backup repair changed gateway settings");
     assert(
       (await readFile(gatewayPidPath, "utf8")).trim() === recoveredGatewayPid,
-      "Backup repair restarted the healthy gateway",
+      "Provider-only adjustment restarted the healthy gateway",
+    );
+    const initialBackupPath = JSON.parse(firstStateRaw).latest_backup_path;
+    await writeFile(
+      statePath,
+      `${JSON.stringify({ ...JSON.parse(stateWithoutBackupRaw), latest_backup_path: initialBackupPath }, null, 2)}\n`,
+      "utf8",
     );
 
     const restoreDefaultPolicyResponse = await fetch(
@@ -783,11 +804,19 @@ async function run() {
     });
     assert(blockedResponse.status === 502, `Default 516 interception was not active: ${blockedResponse.status}`);
 
+    const stopResult = await runPowerShellScript(stopScript, ["-StateRoot", stateRoot]);
+    assert(stopResult.stdout.includes("Codex config restored from"), "Stop did not report Codex config restoration");
+    assert(!(await pathExists(statePath)), "Stop did not clear restored install state");
+    assert(
+      (await readFile(codexConfigPath, "utf8")) === originalCodexConfigRaw,
+      "Stop did not restore the original Codex config backup",
+    );
+
     process.stdout.write("PASS launch-ui flow\n");
   } finally {
     await stopChildProcess(stalePidProcess);
     try {
-      await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet"]);
+      await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet", "-SkipRestore"]);
     } catch {
       // 测试清理阶段允许忽略停止失败，避免覆盖主失败原因。
     }
